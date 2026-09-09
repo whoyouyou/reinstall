@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 通用 Debian 12/13 重装 · 个人单文件版 · GPL-3.0
+# Network compatibility patch: effective IPv4/IPv6 probing + family-aware downloads
 # 上游：https://github.com/bin456789/reinstall
 # 固定版本：5db051675101f31bbe2fb3e093432fa4d1af8dcc
 # 用法：bash reinstall.sh [--check | --extract-only | 安装选项]
@@ -806,12 +807,52 @@ valid_dns() {
 }
 download() {
     local url=$1 dst=$2
-    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
+    local -a family_args=()
+    case ${NETWORK_TYPE:-unknown} in
+        ipv4-only) family_args=(-4) ;;
+        ipv6-only) family_args=(-6) ;;
+    esac
+    curl "${family_args[@]}" --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
         --connect-timeout 15 --max-time 600 --retry 3 --retry-delay 3 \
         --output "$dst.part" "$url"
-    [[ -s $dst.part ]] || die "下载结果为空：$url"
+    [[ -s $dst.part ]] || die "download result is empty: $url"
     mv -- "$dst.part" "$dst"
 }
+
+# Probe the protocol family against the actual Debian repository needed by the
+# reinstall. A default route alone is NOT proof of Internet reachability.
+probe_effective_network() {
+    local url=$1
+    local v4=no v6=no
+
+    if [[ -n $(ip -4 route show default) ]] &&
+       command curl -4 --fail --silent --show-error --location \
+           --connect-timeout 6 --max-time 15 --retry 1 \
+           --output /dev/null "$url"; then
+        v4=yes
+    fi
+
+    if [[ -n $(ip -6 route show default) ]] &&
+       command curl -6 --fail --silent --show-error --location \
+           --connect-timeout 6 --max-time 15 --retry 1 \
+           --output /dev/null "$url"; then
+        v6=yes
+    fi
+
+    IPV4_INTERNET=$v4
+    IPV6_INTERNET=$v6
+    case "$v4:$v6" in
+        yes:yes) NETWORK_TYPE=dual-stack ;;
+        yes:no)  NETWORK_TYPE=ipv4-only ;;
+        no:yes)  NETWORK_TYPE=ipv6-only ;;
+        no:no)   die "IPv4 and IPv6 both failed to reach Debian repository: $url" ;;
+    esac
+
+    export NETWORK_TYPE IPV4_INTERNET IPV6_INTERNET
+    printf 'Internet probe: IPv4=%s | IPv6=%s | effective network=%s\n' \
+        "$IPV4_INTERNET" "$IPV6_INTERNET" "$NETWORK_TYPE"
+}
+
 validate_keys() {
     local src=$1 line count=0
     while IFS= read -r line || [[ -n $line ]]; do
@@ -1016,16 +1057,27 @@ setup_tools() {
 }
 get_asset() {
     local app=$1 out=$2 arch record url sha
+    local -a family_args=()
     arch=$(dpkg --print-architecture)
     record=$(awk -F '\t' -v a="$app" -v b="$arch" '$1==a && $2==b {print $3 " " $4}' "$BASE/assets.tsv")
-    [[ -n $record && $record != *$'\n'* ]] || { echo "No pinned asset for $app/$arch" >&2; return 1; }
+    [[ -n $record && $record != *$'\n'* ]] || { echo "$app/$arch has no pinned asset" >&2; return 1; }
     read -r sha url <<<"$record"
     [[ $sha =~ ^[0-9a-f]{64}$ && $url == https://github.com/* ]]
-    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+
+    case ${NETWORK_TYPE:-unknown} in
+        ipv4-only) family_args=(-4) ;;
+        ipv6-only) family_args=(-6) ;;
+    esac
+
+    rm -f -- "$out.part"
+    printf 'Asset source: %s\n' "$url"
+    curl "${family_args[@]}" --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
         --connect-timeout 15 --max-time 900 --retry 3 --retry-delay 5 -o "$out.part" "$url"
+    [[ -s $out.part ]] || { echo "failed to download $app asset" >&2; return 1; }
     printf '%s  %s\n' "$sha" "$out.part" | sha256sum -c -
     mv "$out.part" "$out"
 }
+
 setup_realm() {
     local tmp binary
     tmp=$(mktemp -d /var/lib/fleet-firstboot/realm.XXXXXXXX)
@@ -1248,7 +1300,7 @@ usage() {
   --disk /dev/DEVICE      核对目标；本版只支持根系统所在的唯一物理盘
   --timezone AREA/CITY    新系统时区
   --dns-server IP         显式指定安装器/新系统上游 DNS，可重复
-  --region global|cn     镜像区域，默认 global
+  --region global        仅使用国际/官方源（默认且唯一支持）
   --non-interactive      禁止交互；必须指定认证方式并加 --yes
   --yes                  确认清空检测到的整个系统盘
   --reboot               准备成功后立即重启；默认仅准备启动项
@@ -1283,7 +1335,7 @@ while (($#)); do
         --port|--ssh-port) need_value "$@"; SSH_PORT=$2; PORT_SET=yes; shift ;;
         --disk) need_value "$@"; DISK=$2; shift ;;
         --timezone) need_value "$@"; TIMEZONE=$2; shift ;;
-        --region) need_value "$@"; REGION=$2; shift ;;
+        --region) need_value "$@"; [[ $2 == global ]] || die '本版禁用国内镜像；--region 仅允许 global'; REGION=global; shift ;;
         --ssh-key) need_value "$@"; KEY_SOURCE=$2; shift ;;
         --github) need_value "$@"; [[ $2 =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$ ]] || die 'GitHub 用户名格式错误'; KEY_SOURCE="github:$2"; shift ;;
         --password-file) need_value "$@"; PASSWORD_FILE=$2; shift ;;
@@ -1296,18 +1348,28 @@ while (($#)); do
 done
 valid_user "$TARGET_USER" || die '用户名格式错误'
 valid_port "$SSH_PORT" || die '端口必须为 1–65535'
-[[ $REGION == global || $REGION == cn ]] || die 'region 必须为 global 或 cn'
+[[ $REGION == global ]] || die '本版禁用国内镜像；region 必须为 global'
 [[ $TIMEZONE =~ ^[a-zA-Z0-9_+/-]+$ && $TIMEZONE != *..* ]] || die '时区格式错误'
 [[ -z $KEY_SOURCE || ( -z $PASSWORD_FILE && -z $PASSWORD_VALUE ) ]] || die '公钥和密码模式二选一'
 [[ -z $PASSWORD_FILE || -z $PASSWORD_VALUE ]] || die '只能选择一种密码输入方式'
 inspect_host
 if [[ $CHECK_ONLY == yes ]]; then
     printf '\n只读检查结束；未写入配置、未下载、未修改启动项。\n'
+    if command -v curl >/dev/null 2>&1; then
+        PROBE_CODENAME=trixie
+        [[ $DEBIAN_VER == 12 ]] && PROBE_CODENAME=bookworm
+        probe_effective_network "https://deb.debian.org/debian/dists/$PROBE_CODENAME/InRelease"
+    else
+        printf 'curl is not installed; --check keeps the route-only classification and does not install packages.\n'
+    fi
     exit 0
 fi
 [[ $EUID == 0 ]] || die '请使用 root 运行'
 source "$BASE/lib/bootstrap-curl.sh"
 ensure_curl
+PROBE_CODENAME=trixie
+[[ $DEBIAN_VER == 12 ]] && PROBE_CODENAME=bookworm
+probe_effective_network "https://deb.debian.org/debian/dists/$PROBE_CODENAME/InRelease"
 for cmd in curl openssl ssh-keygen sha256sum tar gzip cpio; do
     command -v "$cmd" >/dev/null || die "缺少 $cmd；Debian/Ubuntu 可安装 curl ca-certificates openssl openssh-client coreutils tar gzip cpio"
 done
@@ -1367,7 +1429,7 @@ fi
 STAGE=$(mktemp -d /var/lib/fleet-reinstall.XXXXXXXX)
 cleanup() { [[ -z ${STAGE:-} ]] || rm -rf -- "$STAGE"; }
 trap cleanup EXIT
-export FLEET_BUNDLE="$BASE" FLEET_STAGE="$STAGE" FLEET_DISK="$DETECTED_DISK" FLEET_REGION="$REGION"
+export FLEET_BUNDLE="$BASE" FLEET_STAGE="$STAGE" FLEET_DISK="$DETECTED_DISK" FLEET_REGION="$REGION" FLEET_NETWORK_TYPE="$NETWORK_TYPE"
 if [[ -n $KEY_SOURCE ]]; then
     case "$KEY_SOURCE" in
         github:*) download "https://github.com/${KEY_SOURCE#github:}.keys" "$STAGE/keys" ;;
@@ -1388,20 +1450,26 @@ fi
 
 # Only validated, non-secret values are serialized; key/password data never becomes shell code.
 : >"$STAGE/config.sh"
-for key in DEBIAN_VER TARGET_USER SSH_PORT TIMEZONE ENABLE_BBR ENABLE_FAIL2BAN ENABLE_UNATTENDED_UPGRADES ENABLE_REALM ENABLE_S_UI ENABLE_TOOLS; do
+for key in DEBIAN_VER TARGET_USER SSH_PORT TIMEZONE ENABLE_BBR ENABLE_FAIL2BAN ENABLE_UNATTENDED_UPGRADES ENABLE_REALM ENABLE_S_UI ENABLE_TOOLS NETWORK_TYPE IPV4_INTERNET IPV6_INTERNET; do
     printf '%s=%q\n' "$key" "${!key}" >>"$STAGE/config.sh"
 done
 : >"$STAGE/dns.conf"
 if ((${#DNS_SERVERS[@]})); then
     for dns in "${DNS_SERVERS[@]}"; do
-        [[ $NETWORK_TYPE != ipv6-only || $dns == *:* ]] || die '纯 IPv6 主机不能选择 IPv4 DNS'
+        if [[ $NETWORK_TYPE == ipv6-only && $dns != *:* ]]; then
+            die 'IPv6-only effective network cannot use an IPv4 DNS server'
+        fi
+        if [[ $NETWORK_TYPE == ipv4-only && $dns == *:* ]]; then
+            die 'IPv4-only effective network cannot use an IPv6 DNS server'
+        fi
         printf 'nameserver %s\n' "$dns" >>"$STAGE/dns.conf"
     done
 else
     while read -r label dns rest; do
         [[ $label == nameserver ]] || continue
         valid_dns "$dns" || continue
-        [[ $NETWORK_TYPE != ipv6-only || $dns == *:* ]] || continue
+        [[ $NETWORK_TYPE == ipv6-only && $dns != *:* ]] && continue
+        [[ $NETWORK_TYPE == ipv4-only && $dns == *:* ]] && continue
         printf 'nameserver %s\n' "$dns" >>"$STAGE/dns.conf"
     done </etc/resolv.conf
 fi
@@ -3278,6 +3346,15 @@ curl() {
     local fleet_rc=0
     fleet_local_fetch "$@" && return 0 || fleet_rc=$?
     [ "$fleet_rc" -eq 125 ] || return "$fleet_rc"
+    case " $* " in
+    *" -4 "*|*" --ipv4 "*|*" -6 "*|*" --ipv6 "*) ;;
+    *)
+        case "${FLEET_NETWORK_TYPE:-}" in
+            ipv4-only) set -- -4 "$@" ;;
+            ipv6-only) set -- -6 "$@" ;;
+        esac
+        ;;
+    esac
     is_have_cmd curl || install_pkg curl
 
     # 显示 url
@@ -3483,6 +3560,11 @@ test_url_real() {
     url=$2
     expect_types=$3
     var_to_eval=$4
+    fleet_family_arg=
+    case "${FLEET_NETWORK_TYPE:-}" in
+        ipv4-only) fleet_family_arg=-4 ;;
+        ipv6-only) fleet_family_arg=-6 ;;
+    esac
     info test url
 
     failed() {
@@ -3500,7 +3582,7 @@ test_url_real() {
     # ${PIPESTATUS[n]} 表示第n个管道的返回值
     echo $url
     for i in $(seq 5 -1 0); do
-        if command curl --connect-timeout 10 -Lfr 0-1048575 "$url" \
+        if command curl $fleet_family_arg --connect-timeout 10 -Lfr 0-1048575 "$url" \
             1> >(exec head -c 1048576 >$tmp_file) \
             2> >(exec grep -v 'curl: (23)' >&2); then
             break
@@ -17389,14 +17471,14 @@ cat >"$FLEET_UNPACK/SHA256SUMS" <<'FILE_e6351d3766186d2b'
 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986  LICENSE
 224110312e6f8f6063e22c40da7ef0fde7d5dea4707f57511c518775fb77a8ee  lib/adapter.sh
 4327cf8344457b9330597846c14dad2b0e8d404f6673b2e8c79e94e64dff6047  lib/bootstrap-curl.sh
-9d84a0401e7ec8032f845be7bcbe13a33c81589d8f4896bbaaa45a5c41dc3ba0  lib/common.sh
+2bc81ec2c9843007b4f4d40b824d91ac3e6ac93a57fdfd72889d91de8c6cadad  lib/common.sh
 9c287a8c591b63aaaa36c9ecb8bb4113ecef764fc5bbdcd98747771b26852404  payload/assets.tsv
-05703a1fb8befa1db287c047477b5dc177e3adb9a10d04c5e1c3cde34c26f4cc  payload/firstboot.sh
+a7ffaeb0bf0fa7302216b58c210f94bce4d7a09c9f5e2c9f206a6dfc18936034  payload/firstboot.sh
 179a313f229f791861e66e6bae90c5d9c0a9d80e602730a95b9be02ccdc72d2e  payload/fleet-firstboot.service
 7715b63f837ba843c0bbec6d3687297a15c2b9aecc9c0dfe31a4fafd4f08b23b  payload/fleet-firstboot.timer
 24f430c5a64517b15151b181d75df56e4df346f23bfe75ab61a889659a7e8c21  payload/installer-swap.sh
 bfec22711a3a61d31b7bc2de41881822fc5fcb9d9b95c745b870203943c9b79b  payload/late.sh
-1eb0d3be4196be704ae8ec9c911901b7c36eeb81a4b7119d2e37ca97f27c71da  reinstall.sh
+d632285f6b73a34de6d85f7f8d17e794157dff801ac4f5092cacf95b4539e2e1  reinstall.sh
 d852cd8d5dd66fa95e83cd9419093a931fab36d9101271342ec142575e2a4786  upstream-changes.patch
 8db7ea2807b103bfe94a00cf110442d22251299e408a483a26f3f03af5d69121  vendor/debian.cfg
 fbad1d795495505aab7498bdcd37824d92040aa8783023844b5f5f848d8cb496  vendor/fix-eth-name.initd
@@ -17406,7 +17488,7 @@ be4193970891e9e1c480b6d8a587f12f27906e65f5486431b88fc0902806e5bc  vendor/get-xda
 fff9ffca3222bd637671d541adc74424796835365d2624276927d7632641c78d  vendor/initrd-network.sh
 c4a3808e1e2b95ed848e2a69f265c42dd0aae02f86d0394496620165405ef267  vendor/logviewer-nginx.conf
 206afddbb05b992ca049720518bab21b4be5ddd82cf3d09c2a26a7517da2b5d4  vendor/logviewer.html
-c8b499e6c17d02dffde3ffac86988aca5fbe35ec08b653b748a29637ab38ffa1  vendor/reinstall.sh
+65fcf089d69f554e879cf6435c275915f4569503771e934f3d53b5321191eb00  vendor/reinstall.sh
 8224f0c18222c2bf1557c607e1eb7ef24d9f47c782145f67baca8570a6c7e377  vendor/trans.sh
 758f059c42008e89dc4df44a8da893aad8980765fa2ae06779224e96c00c3b74  vendor/ttys.sh
 FILE_e6351d3766186d2b
