@@ -4,7 +4,7 @@
 # 上游：https://github.com/bin456789/reinstall
 # 固定版本：5db051675101f31bbe2fb3e093432fa4d1af8dcc
 # 用法：bash reinstall.sh [--check | --extract-only | 安装选项]
-# 默认 SSH 38965；准备后不自动重启。安装会清空系统盘。
+# 默认 SSH 35965；准备后不自动重启。安装会清空系统盘。
 set -Eeuo pipefail
 umask 077
 for cmd in bash mktemp mkdir cat base64 sha256sum; do
@@ -738,6 +738,9 @@ fleet_customize_initrd() {
     command cp "$FLEET_BUNDLE/payload/firstboot.sh" "$FLEET_BUNDLE/payload/assets.tsv" \
         "$FLEET_BUNDLE/payload/fleet-firstboot.service" "$FLEET_BUNDLE/payload/fleet-firstboot.timer" "$dest/fleet-payload/"
     command cp "$FLEET_STAGE/config.sh" "$dest/fleet-payload/config.sh"
+    if [[ -s $FLEET_STAGE/keys ]]; then
+        command cp "$FLEET_STAGE/keys" "$dest/fleet-payload/ssh_keys"
+    fi
     command cp "$FLEET_STAGE/dns.conf" "$dest/fleet-dns.conf"
     local ca_file
     ca_file=''
@@ -939,7 +942,7 @@ FILE_9724d884ccf5a55d
 # payload/firstboot.sh
 cat >"$FLEET_UNPACK/payload/firstboot.sh" <<'FILE_8e99cf57ef97fff6'
 #!/usr/bin/env bash
-# Debian-only, resumable provisioning. Never modifies addresses, routes or SSH authentication.
+# Debian-only, resumable provisioning. IPv6 is disabled only when explicitly requested and IPv4 was verified.
 set -Eeuo pipefail
 umask 077
 BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -1049,6 +1052,14 @@ EOF
 Unattended-Upgrade::Automatic-Reboot "false";
 EOF
     systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+}
+setup_disable_ipv6() {
+    cat >/etc/sysctl.d/99-fleet-disable-ipv6.conf <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+    sysctl -p /etc/sysctl.d/99-fleet-disable-ipv6.conf
 }
 setup_tools() {
     # iperf3 is a CLI tool here, not an always-running public server.
@@ -1177,6 +1188,8 @@ if [[ $ENABLE_UNATTENDED_UPGRADES == yes ]]; then run_step unattended setup_unat
 if [[ $ENABLE_TOOLS == yes ]]; then run_step tools setup_tools; fi
 if [[ $ENABLE_REALM == yes ]]; then run_step realm setup_realm; fi
 if [[ $ENABLE_S_UI == yes ]]; then run_step sui setup_sui; fi
+# Apply this last so first-boot downloads still have every verified family available.
+if [[ ${DISABLE_IPV6:-no} == yes ]]; then run_step disable_ipv6 setup_disable_ipv6; fi
 if ((failures)); then
     printf '\n%s step(s) failed; see %s/last-run.status. Successful steps are preserved.\n' "$failures" "$STATE"
     exit 1
@@ -1259,6 +1272,28 @@ chmod 700 "$dest/firstboot.sh"
 chmod 600 "$dest/config.sh" "$dest/assets.tsv"
 cp /fleet-payload/fleet-firstboot.service /target/etc/systemd/system/
 cp /fleet-payload/fleet-firstboot.timer /target/etc/systemd/system/
+. /fleet-payload/config.sh
+if [ -s /fleet-payload/ssh_keys ]; then
+    if [ "$TARGET_USER" = root ]; then user_home=/root; else user_home=/home/$TARGET_USER; fi
+    mkdir -p "/target$user_home/.ssh"
+    chmod 700 "/target$user_home/.ssh"
+    cp /fleet-payload/ssh_keys "/target$user_home/.ssh/authorized_keys"
+    chmod 600 "/target$user_home/.ssh/authorized_keys"
+    in-target chown -R "$TARGET_USER:$TARGET_USER" "$user_home/.ssh"
+    mkdir -p /target/etc/ssh/sshd_config.d
+    if [ "${SSH_PASSWORD_AUTH:-yes}" = no ]; then
+        {
+            echo 'PasswordAuthentication no'
+            echo 'KbdInteractiveAuthentication no'
+            [ "$TARGET_USER" != root ] || echo 'PermitRootLogin prohibit-password'
+        } >/target/etc/ssh/sshd_config.d/00-fleet-auth.conf
+    else
+        {
+            echo 'PasswordAuthentication yes'
+            [ "$TARGET_USER" != root ] || echo 'PermitRootLogin yes'
+        } >/target/etc/ssh/sshd_config.d/00-fleet-auth.conf
+    fi
+fi
 mkdir -p /target/run/sshd
 in-target /usr/sbin/sshd -t
 in-target systemctl enable ssh
@@ -1273,13 +1308,14 @@ set -Eeuo pipefail
 umask 077
 BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$BASE/lib/common.sh"
-DEBIAN_VER=13 TARGET_USER=root SSH_PORT=38965 TIMEZONE=Asia/Hong_Kong
+DEBIAN_VER=13 TARGET_USER=root SSH_PORT=35965 TIMEZONE=Asia/Hong_Kong
 CHECK_ONLY=no NONINTERACTIVE=no AUTO_REBOOT=no CONFIRMED=no
 KEY_SOURCE='' PASSWORD_FILE='' PASSWORD_VALUE='' DISK='' REGION=global
+SSH_PASSWORD_AUTH=auto DISABLE_IPV6=no
 ENABLE_BBR=no ENABLE_FAIL2BAN=no ENABLE_UNATTENDED_UPGRADES=no
 ENABLE_REALM=no ENABLE_S_UI=no ENABLE_TOOLS=no
 DNS_SERVERS=()
-USER_SET=no PORT_SET=no PROFILE_SET=no
+USER_SET=no PORT_SET=no PROFILE_SET=no SSH_AUTH_POLICY_SET=no IPV6_POLICY_SET=no
 
 usage() {
     cat <<'EOF'
@@ -1289,11 +1325,14 @@ usage() {
   bash reinstall.sh 12|13 [options]
 
   --user NAME              登录用户，默认 root
-  --port N                 SSH 端口，默认 38965
+  --port N                 SSH 端口，默认 35965
   --ssh-key FILE_OR_KEY    公钥文件或完整公钥（可含多行）
   --github USER           从 GitHub 获取公钥，失败即停止
-  --password-file FILE    从文件读取登录密码（单行），与公钥模式二选一
+  --password-file FILE    从文件读取系统账户密码（单行）
   --pwd PASSWORD          兼容旧参数；推荐使用密码文件，避免 shell 历史记录
+  --disable-ssh-password  有公钥时禁用 SSH 密码登录；账户密码仍可用于本地/VNC 控制台
+  --enable-ssh-password   有公钥时仍允许 SSH 密码登录
+  --disable-ipv6          仅在 IPv4 已验证可公网出网时允许；IPv6-only 会拒绝
   --profile-full          BBR、Fail2ban、自动安全更新、Realm、S-UI、工具包
   --with-bbr / --with-fail2ban / --with-unattended-upgrades
   --with-realm / --with-s-ui / --with-tools
@@ -1340,8 +1379,10 @@ while (($#)); do
         --github) need_value "$@"; [[ $2 =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$ ]] || die 'GitHub 用户名格式错误'; KEY_SOURCE="github:$2"; shift ;;
         --password-file) need_value "$@"; PASSWORD_FILE=$2; shift ;;
         --pwd|--password) need_value "$@"; PASSWORD_VALUE=$2; shift ;;
+        --disable-ssh-password) SSH_PASSWORD_AUTH=no; SSH_AUTH_POLICY_SET=yes ;;
+        --enable-ssh-password) SSH_PASSWORD_AUTH=yes; SSH_AUTH_POLICY_SET=yes ;;
         --dns-server) need_value "$@"; valid_dns "$2" || die 'DNS 必须是直接可达的上游 IP'; DNS_SERVERS+=("$2"); shift ;;
-        --disable-ipv6) die '通用版保留 IPv6；请在装好并验证管理通道后单独调整。' ;;
+        --disable-ipv6) DISABLE_IPV6=yes; IPV6_POLICY_SET=yes ;;
         *) die "未知参数：$1" ;;
     esac
     shift
@@ -1350,7 +1391,6 @@ valid_user "$TARGET_USER" || die '用户名格式错误'
 valid_port "$SSH_PORT" || die '端口必须为 1–65535'
 [[ $REGION == global ]] || die '本版禁用国内镜像；region 必须为 global'
 [[ $TIMEZONE =~ ^[a-zA-Z0-9_+/-]+$ && $TIMEZONE != *..* ]] || die '时区格式错误'
-[[ -z $KEY_SOURCE || ( -z $PASSWORD_FILE && -z $PASSWORD_VALUE ) ]] || die '公钥和密码模式二选一'
 [[ -z $PASSWORD_FILE || -z $PASSWORD_VALUE ]] || die '只能选择一种密码输入方式'
 inspect_host
 if [[ $CHECK_ONLY == yes ]]; then
@@ -1370,6 +1410,11 @@ ensure_curl
 PROBE_CODENAME=trixie
 [[ $DEBIAN_VER == 12 ]] && PROBE_CODENAME=bookworm
 probe_effective_network "https://deb.debian.org/debian/dists/$PROBE_CODENAME/InRelease"
+
+# IPv6 may only be disabled when verified IPv4 Internet remains available.
+if [[ $DISABLE_IPV6 == yes && $IPV4_INTERNET != yes ]]; then
+    die '当前没有已验证可用的 IPv4 公网；为避免失联，禁止禁用 IPv6'
+fi
 for cmd in curl openssl ssh-keygen sha256sum tar gzip cpio; do
     command -v "$cmd" >/dev/null || die "缺少 $cmd；Debian/Ubuntu 可安装 curl ca-certificates openssl openssh-client coreutils tar gzip cpio"
 done
@@ -1389,6 +1434,20 @@ if [[ $NONINTERACTIVE == no ]]; then
         SSH_PORT=${value:-$SSH_PORT}
         valid_port "$SSH_PORT" || die '端口必须为 1–65535'
     fi
+    if [[ $IPV6_POLICY_SET == no ]]; then
+        case $NETWORK_TYPE in
+            dual-stack)
+                read -r -p '禁用新系统 IPv6？[y/N]：' value
+                [[ $value =~ ^[Yy]$ ]] && DISABLE_IPV6=yes
+                ;;
+            ipv6-only)
+                printf '当前仅 IPv6 可公网出网；为避免失联，将保留 IPv6，不提供禁用选项。\n'
+                ;;
+        esac
+    fi
+    if [[ $DISABLE_IPV6 == yes && $IPV4_INTERNET != yes ]]; then
+        die '当前没有已验证可用的 IPv4 公网；为避免失联，禁止禁用 IPv6'
+    fi
     if [[ $PROFILE_SET == no ]]; then
         read -r -p '启用全能预设（Realm/S-UI 预装后待配置）？[y/N]：' value
         if [[ $value =~ ^[Yy]$ ]]; then
@@ -1401,8 +1460,34 @@ if [[ $NONINTERACTIVE == no ]]; then
         fi
     fi
     if [[ -z $KEY_SOURCE && -z $PASSWORD_FILE && -z $PASSWORD_VALUE ]]; then
-        read -r -p 'SSH 公钥文件路径（留空使用密码）：' KEY_SOURCE
-        if [[ -z $KEY_SOURCE ]]; then
+        read -r -p 'SSH 公钥文件路径或完整公钥内容（留空使用密码）：' KEY_SOURCE
+    fi
+
+    if [[ -n $KEY_SOURCE ]]; then
+        if [[ $SSH_AUTH_POLICY_SET == no ]]; then
+            read -r -p '禁用 SSH 密码登录？[Y/n]：' value
+            if [[ $value =~ ^[Nn]$ ]]; then SSH_PASSWORD_AUTH=yes; else SSH_PASSWORD_AUTH=no; fi
+        fi
+        if [[ -z $PASSWORD_FILE && -z $PASSWORD_VALUE ]]; then
+            if [[ $SSH_PASSWORD_AUTH == no ]]; then
+                PASSWORD_VALUE=$(openssl rand -hex 16)
+                printf '已禁用 SSH 密码登录。请保存系统控制台/VNC 备用密码：%s\n' "$PASSWORD_VALUE"
+            else
+                read -r -s -p 'SSH/控制台登录密码（留空生成随机密码）：' PASSWORD_VALUE; printf '\n'
+                if [[ -z $PASSWORD_VALUE ]]; then
+                    PASSWORD_VALUE=$(openssl rand -hex 16)
+                    printf '请保存 SSH/控制台登录密码：%s\n' "$PASSWORD_VALUE"
+                else
+                    read -r -s -p '再次输入密码：' CONFIRM_PASSWORD; printf '\n'
+                    [[ $PASSWORD_VALUE == "$CONFIRM_PASSWORD" ]] || die '两次密码不一致'
+                    unset CONFIRM_PASSWORD
+                fi
+            fi
+        fi
+    else
+        [[ $SSH_PASSWORD_AUTH != no ]] || die '没有 SSH 公钥时不能禁用 SSH 密码登录'
+        SSH_PASSWORD_AUTH=yes
+        if [[ -z $PASSWORD_FILE && -z $PASSWORD_VALUE ]]; then
             read -r -s -p '登录密码（留空生成随机密码）：' PASSWORD_VALUE; printf '\n'
             if [[ -z $PASSWORD_VALUE ]]; then
                 PASSWORD_VALUE=$(openssl rand -hex 16)
@@ -1417,12 +1502,25 @@ if [[ $NONINTERACTIVE == no ]]; then
 else
     [[ $CONFIRMED == yes ]] || die '非交互模式必须加 --yes，确认清空系统盘'
     [[ -n $KEY_SOURCE || -n $PASSWORD_FILE || -n $PASSWORD_VALUE ]] || die '非交互模式必须指定认证方式'
+    if [[ -n $KEY_SOURCE ]]; then
+        [[ $SSH_PASSWORD_AUTH != auto ]] || SSH_PASSWORD_AUTH=no
+        if [[ -z $PASSWORD_FILE && -z $PASSWORD_VALUE ]]; then
+            PASSWORD_VALUE=$(openssl rand -hex 16)
+            printf '已生成系统控制台/VNC 备用密码：%s\n' "$PASSWORD_VALUE"
+        fi
+    else
+        [[ $SSH_PASSWORD_AUTH != no ]] || die '没有 SSH 公钥时不能禁用 SSH 密码登录'
+        SSH_PASSWORD_AUTH=yes
+    fi
 fi
+[[ $SSH_PASSWORD_AUTH != auto ]] || SSH_PASSWORD_AUTH=yes
 printf '\n将安装 Debian %s，用户 %s，SSH 端口 %s。\n' "$DEBIAN_VER" "$TARGET_USER" "$SSH_PORT"
 printf '将清空整块系统盘 %s 上的所有分区。\n' "$DETECTED_DISK"
 if [[ $CONFIRMED != yes ]]; then
-    read -r -p "输入 ERASE 确认准备重装：" answer
-    [[ $answer == ERASE ]] || die '已取消'
+    confirm_code=$((100000 + (RANDOM * 32768 + RANDOM) % 900000))
+    printf '为防止误操作，请输入随机确认码 %s 继续。\n' "$confirm_code"
+    read -r -p '确认码：' answer
+    [[ $answer == "$confirm_code" ]] || die '确认码错误，已取消'
 fi
 
 # Private staging directory lives on disk, not /tmp (which can be tmpfs).
@@ -1436,21 +1534,21 @@ if [[ -n $KEY_SOURCE ]]; then
         *) if [[ -f $KEY_SOURCE ]]; then cp -- "$KEY_SOURCE" "$STAGE/keys"; else printf '%s\n' "$KEY_SOURCE" >"$STAGE/keys"; fi ;;
     esac
     validate_keys "$STAGE/keys"
-    args=(debian "$DEBIAN_VER" --installer --username "$TARGET_USER" --ssh-port "$SSH_PORT" --ssh-key "$STAGE/keys")
-else
-    if [[ -n $PASSWORD_FILE ]]; then
-        [[ -f $PASSWORD_FILE ]] || die '密码文件不存在'
-        PASSWORD_VALUE=$(cat -- "$PASSWORD_FILE")
-    fi
-    [[ -n $PASSWORD_VALUE && $PASSWORD_VALUE != *$'\n'* && $PASSWORD_VALUE != *$'\r'* ]] || die '密码必须是非空单行文本'
-    printf '%s' "$PASSWORD_VALUE" >"$STAGE/password"
-    unset PASSWORD_VALUE
-    args=(debian "$DEBIAN_VER" --installer --username "$TARGET_USER" --ssh-port "$SSH_PORT")
 fi
+if [[ -n $PASSWORD_FILE ]]; then
+    [[ -f $PASSWORD_FILE ]] || die '密码文件不存在'
+    PASSWORD_VALUE=$(cat -- "$PASSWORD_FILE")
+fi
+[[ -n $PASSWORD_VALUE && $PASSWORD_VALUE != *$'\n'* && $PASSWORD_VALUE != *$'\r'* ]] || die '密码必须是非空单行文本'
+printf '%s' "$PASSWORD_VALUE" >"$STAGE/password"
+unset PASSWORD_VALUE
+# The vendor engine receives the account password. Fleet installs the SSH key later,
+# so a console/VNC password can coexist with key-only SSH authentication.
+args=(debian "$DEBIAN_VER" --installer --username "$TARGET_USER" --ssh-port "$SSH_PORT")
 
 # Only validated, non-secret values are serialized; key/password data never becomes shell code.
 : >"$STAGE/config.sh"
-for key in DEBIAN_VER TARGET_USER SSH_PORT TIMEZONE ENABLE_BBR ENABLE_FAIL2BAN ENABLE_UNATTENDED_UPGRADES ENABLE_REALM ENABLE_S_UI ENABLE_TOOLS NETWORK_TYPE IPV4_INTERNET IPV6_INTERNET; do
+for key in DEBIAN_VER TARGET_USER SSH_PORT TIMEZONE ENABLE_BBR ENABLE_FAIL2BAN ENABLE_UNATTENDED_UPGRADES ENABLE_REALM ENABLE_S_UI ENABLE_TOOLS NETWORK_TYPE IPV4_INTERNET IPV6_INTERNET SSH_PASSWORD_AUTH DISABLE_IPV6; do
     printf '%s=%q\n' "$key" "${!key}" >>"$STAGE/config.sh"
 done
 : >"$STAGE/dns.conf"
@@ -17469,16 +17567,16 @@ FILE_86b478219b9a9285
 # SHA256SUMS
 cat >"$FLEET_UNPACK/SHA256SUMS" <<'FILE_e6351d3766186d2b'
 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986  LICENSE
-224110312e6f8f6063e22c40da7ef0fde7d5dea4707f57511c518775fb77a8ee  lib/adapter.sh
+0738dc4b95db6c739aa816ac99fead8feefb70f543e5b352f38475838a6f9360  lib/adapter.sh
 4327cf8344457b9330597846c14dad2b0e8d404f6673b2e8c79e94e64dff6047  lib/bootstrap-curl.sh
 2bc81ec2c9843007b4f4d40b824d91ac3e6ac93a57fdfd72889d91de8c6cadad  lib/common.sh
 9c287a8c591b63aaaa36c9ecb8bb4113ecef764fc5bbdcd98747771b26852404  payload/assets.tsv
-a7ffaeb0bf0fa7302216b58c210f94bce4d7a09c9f5e2c9f206a6dfc18936034  payload/firstboot.sh
+a6f3606927371529d563e6ba8ad51a352cf6d0bd8a06ee17396c066b94e81644  payload/firstboot.sh
 179a313f229f791861e66e6bae90c5d9c0a9d80e602730a95b9be02ccdc72d2e  payload/fleet-firstboot.service
 7715b63f837ba843c0bbec6d3687297a15c2b9aecc9c0dfe31a4fafd4f08b23b  payload/fleet-firstboot.timer
 24f430c5a64517b15151b181d75df56e4df346f23bfe75ab61a889659a7e8c21  payload/installer-swap.sh
-bfec22711a3a61d31b7bc2de41881822fc5fcb9d9b95c745b870203943c9b79b  payload/late.sh
-d632285f6b73a34de6d85f7f8d17e794157dff801ac4f5092cacf95b4539e2e1  reinstall.sh
+4a10b672dbc6433af77e0106a05e9ca62adfccbe29a3e4b4fd017468681292b0  payload/late.sh
+59f7fb7e07761065d31c713edb8f4e7bfbc18c0150fb9fd3f254665cd119a43b  reinstall.sh
 d852cd8d5dd66fa95e83cd9419093a931fab36d9101271342ec142575e2a4786  upstream-changes.patch
 8db7ea2807b103bfe94a00cf110442d22251299e408a483a26f3f03af5d69121  vendor/debian.cfg
 fbad1d795495505aab7498bdcd37824d92040aa8783023844b5f5f848d8cb496  vendor/fix-eth-name.initd
