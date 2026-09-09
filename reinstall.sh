@@ -953,6 +953,7 @@ exec 9>"$STATE/lock"
 flock -n 9 || exit 0
 export DEBIAN_FRONTEND=noninteractive
 failures=0
+pending_optional=0
 : >"$STATE/last-run.status"
 
 run_step() {
@@ -975,6 +976,19 @@ run_step() {
         failures=$((failures + 1))
         printf '%s: FAILED (%s); will retry\n' "$name" "$rc" | tee -a "$STATE/last-run.status"
     fi
+}
+mark_optional_skipped() {
+    local name=$1 reason=$2
+    pending_optional=1
+    printf '%s: SKIPPED (%s); manual retry available\n' "$name" "$reason" | tee -a "$STATE/last-run.status"
+}
+github_optional_available() {
+    # On an IPv6-only host, GitHub Releases may be unavailable even though Debian and
+    # raw.githubusercontent.com work. Treat that as a temporary optional dependency,
+    # not as a failure of the base system.
+    [[ ${NETWORK_TYPE:-unknown} == ipv6-only ]] || return 0
+    curl -6 --fail --silent --location --head --proto '=https' --proto-redir '=https' \
+        --connect-timeout 8 --max-time 15 https://github.com/ >/dev/null 2>&1
 }
 apt_install() {
     apt-get -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 install -y --no-install-recommends "$@"
@@ -1053,7 +1067,30 @@ Unattended-Upgrade::Automatic-Reboot "false";
 EOF
     systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
 }
+verify_ipv4_before_disable() {
+    # A loopback resolver may forward over IPv6. Refuse unknown upstreams rather
+    # than rewriting the administrator's DNS or disabling a required family.
+    local tag addr rest count=0
+    while read -r tag addr rest; do
+        [[ $tag == nameserver ]] || continue
+        count=$((count + 1))
+        if [[ ! $addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || $addr == 127.* || $addr == 0.* ]]; then
+            echo '保留 IPv6：请先配置直接可用的 IPv4 DNS；IPv6 或本地转发 DNS 尚未验证。' >&2
+            return 1
+        fi
+    done </etc/resolv.conf
+    ((count > 0)) || { echo '保留 IPv6：未找到直接 IPv4 DNS。' >&2; return 1; }
+    local suite=trixie
+    [[ $DEBIAN_VER != 12 ]] || suite=bookworm
+    curl -4 --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --connect-timeout 10 --max-time 45 --retry 1 --output /dev/null \
+        "https://deb.debian.org/debian/dists/$suite/InRelease" || {
+        echo '保留 IPv6：新系统 IPv4/DNS 联合检查未通过。' >&2
+        return 1
+    }
+}
 setup_disable_ipv6() {
+    verify_ipv4_before_disable || return 1
     cat >/etc/sysctl.d/99-fleet-disable-ipv6.conf <<'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
@@ -1186,13 +1223,48 @@ if [[ $ENABLE_BBR == yes ]]; then run_step bbr setup_bbr; fi
 if [[ $ENABLE_FAIL2BAN == yes ]]; then run_step fail2ban setup_fail2ban; fi
 if [[ $ENABLE_UNATTENDED_UPGRADES == yes ]]; then run_step unattended setup_unattended; fi
 if [[ $ENABLE_TOOLS == yes ]]; then run_step tools setup_tools; fi
-if [[ $ENABLE_REALM == yes ]]; then run_step realm setup_realm; fi
-if [[ $ENABLE_S_UI == yes ]]; then run_step sui setup_sui; fi
+
+# Realm and S-UI are optional GitHub Release components. On IPv6-only hosts,
+# github.com itself may be unreachable while the Debian base system is healthy.
+# In that specific case, record SKIPPED, keep the step retryable, and do not fail
+# the whole first-boot provisioning run.
+github_optional_ok=yes
+if [[ ${NETWORK_TYPE:-unknown} == ipv6-only && ( $ENABLE_REALM == yes || $ENABLE_S_UI == yes ) ]]; then
+    if ! github_optional_available; then
+        github_optional_ok=no
+        printf 'GitHub is unavailable over the verified IPv6-only network; optional GitHub Release components will be skipped for now.\n'
+    fi
+fi
+if [[ $ENABLE_REALM == yes ]]; then
+    if [[ $github_optional_ok == yes ]]; then
+        run_step realm setup_realm
+    else
+        mark_optional_skipped realm 'GitHub unavailable on IPv6-only network'
+    fi
+fi
+if [[ $ENABLE_S_UI == yes ]]; then
+    if [[ $github_optional_ok == yes ]]; then
+        run_step sui setup_sui
+    else
+        mark_optional_skipped sui 'GitHub unavailable on IPv6-only network'
+    fi
+fi
 # Apply this last so first-boot downloads still have every verified family available.
 if [[ ${DISABLE_IPV6:-no} == yes ]]; then run_step disable_ipv6 setup_disable_ipv6; fi
 if ((failures)); then
     printf '\n%s step(s) failed; see %s/last-run.status. Successful steps are preserved.\n' "$failures" "$STATE"
     exit 1
+fi
+if ((pending_optional)); then
+    # Core provisioning succeeded. Do not create the final completion marker so
+    # an administrator can retry the skipped optional steps later. Stop automatic
+    # retries now to avoid noisy 15-minute attempts on a known-unreachable endpoint.
+    rm -f "$STATE/complete"
+    systemctl disable --now fleet-firstboot.timer || true
+    printf '\nFleet core provisioning finished; optional GitHub components were skipped.\n'
+    printf 'One-shot retry: systemctl start fleet-firstboot.service\n'
+    printf 'Re-enable 15-minute retries: systemctl enable --now fleet-firstboot.timer\n'
+    exit 0
 fi
 : >"$STATE/complete"
 systemctl disable --now fleet-firstboot.timer
@@ -1392,6 +1464,11 @@ valid_port "$SSH_PORT" || die '端口必须为 1–65535'
 [[ $REGION == global ]] || die '本版禁用国内镜像；region 必须为 global'
 [[ $TIMEZONE =~ ^[a-zA-Z0-9_+/-]+$ && $TIMEZONE != *..* ]] || die '时区格式错误'
 [[ -z $PASSWORD_FILE || -z $PASSWORD_VALUE ]] || die '只能选择一种密码输入方式'
+if [[ $CHECK_ONLY != yes ]]; then
+    [[ $(uname -s) == Linux && $EUID == 0 ]] || die '请在 Linux 原系统中使用 root 运行'
+    source "$BASE/lib/bootstrap-curl.sh"
+    ensure_host_dependencies
+fi
 inspect_host
 if [[ $CHECK_ONLY == yes ]]; then
     printf '\n只读检查结束；未写入配置、未下载、未修改启动项。\n'
@@ -1405,8 +1482,6 @@ if [[ $CHECK_ONLY == yes ]]; then
     exit 0
 fi
 [[ $EUID == 0 ]] || die '请使用 root 运行'
-source "$BASE/lib/bootstrap-curl.sh"
-ensure_curl
 PROBE_CODENAME=trixie
 [[ $DEBIAN_VER == 12 ]] && PROBE_CODENAME=bookworm
 probe_effective_network "https://deb.debian.org/debian/dists/$PROBE_CODENAME/InRelease"
@@ -1554,20 +1629,12 @@ done
 : >"$STAGE/dns.conf"
 if ((${#DNS_SERVERS[@]})); then
     for dns in "${DNS_SERVERS[@]}"; do
-        if [[ $NETWORK_TYPE == ipv6-only && $dns != *:* ]]; then
-            die 'IPv6-only effective network cannot use an IPv4 DNS server'
-        fi
-        if [[ $NETWORK_TYPE == ipv4-only && $dns == *:* ]]; then
-            die 'IPv4-only effective network cannot use an IPv6 DNS server'
-        fi
         printf 'nameserver %s\n' "$dns" >>"$STAGE/dns.conf"
     done
 else
     while read -r label dns rest; do
         [[ $label == nameserver ]] || continue
         valid_dns "$dns" || continue
-        [[ $NETWORK_TYPE == ipv6-only && $dns != *:* ]] && continue
-        [[ $NETWORK_TYPE == ipv4-only && $dns == *:* ]] && continue
         printf 'nameserver %s\n' "$dns" >>"$STAGE/dns.conf"
     done </etc/resolv.conf
 fi
@@ -1708,6 +1775,20 @@ cat >"$FLEET_UNPACK/upstream-changes.patch" <<'FILE_ae78407ecd64fa12'
 +    sh /fleet-late.sh
 +
 +d-i pkgsel/include string openssh-server ca-certificates
+
+--- before-fix/debian.cfg
++++ after-fix/debian.cfg
+@@ -313,8 +313,8 @@
+     cp $postinst $postinst.orig; \
+     true >$postinst; \
+ 
+-    echo "sh /fleet-installer-swap.sh" >>$postinst; \
+-    echo "swapoff -a; rm -f $swapfile" >/usr/lib/finish-install.d/95swapoff; \
++    echo "sh /fleet-installer-swap.sh || exit 1" >>$postinst; \
++    echo 'if [ -f /target/swapfile ]; then if grep -q "^/target/swapfile[[:space:]]" /proc/swaps; then swapoff /target/swapfile || exit 1; fi; rm -f /target/swapfile; fi'  >/usr/lib/finish-install.d/95swapoff; \
+     chmod a+x /usr/lib/finish-install.d/95swapoff; \
+ 
+     echo "rm -rf /target/boot/efi/*; $postinst.orig" >>$postinst; \
 FILE_ae78407ecd64fa12
 
 # vendor/debian.cfg
@@ -2027,8 +2108,8 @@ d-i partman/early_command string true; \
     cp $postinst $postinst.orig; \
     true >$postinst; \
 
-    echo "sh /fleet-installer-swap.sh" >>$postinst; \
-    echo "swapoff -a; rm -f $swapfile" >/usr/lib/finish-install.d/95swapoff; \
+    echo "sh /fleet-installer-swap.sh || exit 1" >>$postinst; \
+    echo 'if [ -f /target/swapfile ]; then if grep -q "^/target/swapfile[[:space:]]" /proc/swaps; then swapoff /target/swapfile || exit 1; fi; rm -f /target/swapfile; fi'  >/usr/lib/finish-install.d/95swapoff; \
     chmod a+x /usr/lib/finish-install.d/95swapoff; \
 
     echo "rm -rf /target/boot/efi/*; $postinst.orig" >>$postinst; \
@@ -3077,13 +3158,7 @@ FILE_31f3b183ef9a8985
 
 # vendor/logviewer-nginx.conf
 base64 --decode >"$FLEET_UNPACK/vendor/logviewer-nginx.conf" <<'FILE_710273baf7f4e0b3'
-c2VydmVyIHsKICAgIGxpc3RlbiBAV0VCX1BPUlRAOwogICAgbGlzdGVuIFs6Ol06QFdFQl9QT1JU
-QDsKICAgIHJvb3QgLzsKCiAgICBnemlwIG9uOwogICAgZ3ppcF90eXBlcyB0ZXh0L3BsYWluOwoK
-CiAgICBsb2NhdGlvbiA9IC8gewogICAgICAgIHRyeV9maWxlcyAvbG9ndmlld2VyLmh0bWwgNDA0
-OwogICAgfQoKICAgIGxvY2F0aW9uID0gL3JlaW5zdGFsbC5sb2cgewogICAgICAgIHR5cGVzIHsK
-ICAgICAgICAgICAgdGV4dC9wbGFpbiBsb2c7CiAgICAgICAgfQoKICAgICAgICB0cnlfZmlsZXMg
-JHVyaSA0MDQ7CiAgICB9CgogICAgbG9jYXRpb24gLyB7CiAgICAgICAgcmV0dXJuIDQwNDsKICAg
-IH0KfQ==
+c2VydmVyIHsKICAgIGxpc3RlbiBAV0VCX1BPUlRAOwogICAgbGlzdGVuIFs6Ol06QFdFQl9QT1JUQDsKICAgIHJvb3QgLzsKCiAgICBnemlwIG9uOwogICAgZ3ppcF90eXBlcyB0ZXh0L3BsYWluOwoKCiAgICBsb2NhdGlvbiA9IC8gewogICAgICAgIHRyeV9maWxlcyAvbG9ndmlld2VyLmh0bWwgNDA0OwogICAgfQoKICAgIGxvY2F0aW9uID0gL3JlaW5zdGFsbC5sb2cgewogICAgICAgIHR5cGVzIHsKICAgICAgICAgICAgdGV4dC9wbGFpbiBsb2c7CiAgICAgICAgfQoKICAgICAgICB0cnlfZmlsZXMgJHVyaSA0MDQ7CiAgICB9CgogICAgbG9jYXRpb24gLyB7CiAgICAgICAgcmV0dXJuIDQwNDsKICAgIH0KfQ==
 FILE_710273baf7f4e0b3
 
 # vendor/logviewer.html
@@ -17562,23 +17637,39 @@ ensure_curl() {
         return 1
     }
 }
+
+ensure_host_dependencies() {
+    local cmd missing=no
+    for cmd in ip lsblk findmnt awk sort readlink grep curl openssl ssh-keygen sha256sum tar gzip cpio; do
+        command -v "$cmd" >/dev/null 2>&1 || missing=yes
+    done
+    if [[ $missing == yes ]]; then
+        command -v apt-get >/dev/null 2>&1 || die '缺少必要依赖；非 apt 系统请手动安装 iproute2 util-linux awk coreutils grep curl ca-certificates openssl openssh-client tar gzip cpio'
+        apt-get -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 update || return 1
+        apt-get -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 install -y --no-install-recommends iproute2 util-linux gawk coreutils grep curl ca-certificates openssl openssh-client tar gzip cpio tzdata || return 1
+    fi
+    ensure_curl || return 1
+    for cmd in ip lsblk findmnt awk sort readlink grep curl openssl ssh-keygen sha256sum tar gzip cpio; do
+        command -v "$cmd" >/dev/null 2>&1 || die "安装后仍缺少命令：$cmd"
+    done
+}
 FILE_86b478219b9a9285
 
 # SHA256SUMS
 cat >"$FLEET_UNPACK/SHA256SUMS" <<'FILE_e6351d3766186d2b'
-3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986  LICENSE
 0738dc4b95db6c739aa816ac99fead8feefb70f543e5b352f38475838a6f9360  lib/adapter.sh
-4327cf8344457b9330597846c14dad2b0e8d404f6673b2e8c79e94e64dff6047  lib/bootstrap-curl.sh
+976d9da2e1ab8dc29c10b560afbe30a2dc455e56a3915a60b3b5bd3a651983e2  lib/bootstrap-curl.sh
 2bc81ec2c9843007b4f4d40b824d91ac3e6ac93a57fdfd72889d91de8c6cadad  lib/common.sh
+3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986  LICENSE
 9c287a8c591b63aaaa36c9ecb8bb4113ecef764fc5bbdcd98747771b26852404  payload/assets.tsv
-a6f3606927371529d563e6ba8ad51a352cf6d0bd8a06ee17396c066b94e81644  payload/firstboot.sh
+4fb0603fe9837382bcb6f3022e458fedc64c7aaaf2ec1fb54f025756d4ac6416  payload/firstboot.sh
 179a313f229f791861e66e6bae90c5d9c0a9d80e602730a95b9be02ccdc72d2e  payload/fleet-firstboot.service
 7715b63f837ba843c0bbec6d3687297a15c2b9aecc9c0dfe31a4fafd4f08b23b  payload/fleet-firstboot.timer
 24f430c5a64517b15151b181d75df56e4df346f23bfe75ab61a889659a7e8c21  payload/installer-swap.sh
 4a10b672dbc6433af77e0106a05e9ca62adfccbe29a3e4b4fd017468681292b0  payload/late.sh
-59f7fb7e07761065d31c713edb8f4e7bfbc18c0150fb9fd3f254665cd119a43b  reinstall.sh
-d852cd8d5dd66fa95e83cd9419093a931fab36d9101271342ec142575e2a4786  upstream-changes.patch
-8db7ea2807b103bfe94a00cf110442d22251299e408a483a26f3f03af5d69121  vendor/debian.cfg
+9164dcc56a2012fbaa47cf88a33bd3fdbaf4a9f2e047a5d0d4af52adbf85663c  reinstall.sh
+6d7c281c455bccd7b06e8e097ac26e52ebf4daeb4ddd964ab55bea1b66f3a2c5  upstream-changes.patch
+721e4ffeb3ca90d8db48229a720d1948c096fdd1917d1731f30e07058e25586c  vendor/debian.cfg
 fbad1d795495505aab7498bdcd37824d92040aa8783023844b5f5f848d8cb496  vendor/fix-eth-name.initd
 dc667f379b23b13f51f22f8e609bed19e544fcca94b2037faa99bc7f04a90050  vendor/fix-eth-name.service
 4b4505ce0ddc40e90dc12d369460136fa9add6cb2dbea6df280650b9517ebd9f  vendor/fix-eth-name.sh
