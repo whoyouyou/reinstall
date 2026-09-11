@@ -772,6 +772,27 @@ FILE_ffad207ed6b53f98
 
 # lib/common.sh
 cat >"$FLEET_UNPACK/lib/common.sh" <<'FILE_cfcb1fb44601d83d'
+detect_host_timezone() {
+    local tz=""
+    if command -v timedatectl >/dev/null 2>&1; then
+        tz=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
+    fi
+    if [[ -z $tz && -s /etc/timezone ]]; then
+        tz=$(head -n 1 /etc/timezone | tr -d '[:space:]')
+    fi
+    if [[ -z $tz && -L /etc/localtime ]]; then
+        local target
+        target=$(readlink -f /etc/localtime 2>/dev/null || true)
+        if [[ $target == */zoneinfo/* ]]; then
+            tz=${target#*/zoneinfo/}
+        fi
+    fi
+    if [[ -n $tz && -f /usr/share/zoneinfo/$tz ]]; then
+        printf '%s' "$tz"
+    else
+        printf '%s' 'Asia/Hong_Kong'
+    fi
+}
 #!/usr/bin/env bash
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 need_value() { [[ $# -ge 2 && -n $2 && $2 != --* ]] || die "$1 缺少参数"; }
@@ -1380,7 +1401,7 @@ set -Eeuo pipefail
 umask 077
 BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$BASE/lib/common.sh"
-DEBIAN_VER=13 TARGET_USER=root SSH_PORT=35965 TIMEZONE=Asia/Hong_Kong
+DEBIAN_VER=13 TARGET_USER=root SSH_PORT=35965 TIMEZONE=$(detect_host_timezone)
 CHECK_ONLY=no NONINTERACTIVE=no AUTO_REBOOT=no CONFIRMED=no
 KEY_SOURCE='' PASSWORD_FILE='' PASSWORD_VALUE='' DISK='' REGION=global
 SSH_PASSWORD_AUTH=auto DISABLE_IPV6=no
@@ -1409,7 +1430,7 @@ usage() {
   --with-bbr / --with-fail2ban / --with-unattended-upgrades
   --with-realm / --with-s-ui / --with-tools
   --disk /dev/DEVICE      核对目标；本版只支持根系统所在的唯一物理盘
-  --timezone AREA/CITY    新系统时区
+  --timezone AREA/CITY    新系统时区（默认继承宿主机时区，后备: Asia/Hong_Kong）
   --dns-server IP         显式指定安装器/新系统上游 DNS，可重复
   --region global        仅使用国际/官方源（默认且唯一支持）
   --non-interactive      禁止交互；必须指定认证方式并加 --yes
@@ -17705,7 +17726,7 @@ FILE_86b478219b9a9285
 cat >"$FLEET_UNPACK/SHA256SUMS" <<'FILE_e6351d3766186d2b'
 0738dc4b95db6c739aa816ac99fead8feefb70f543e5b352f38475838a6f9360  lib/adapter.sh
 976d9da2e1ab8dc29c10b560afbe30a2dc455e56a3915a60b3b5bd3a651983e2  lib/bootstrap-curl.sh
-2bc81ec2c9843007b4f4d40b824d91ac3e6ac93a57fdfd72889d91de8c6cadad  lib/common.sh
+741fb739b563e288857d38fea6d2d083cd36475be9944dbaecb2e4ef03160586  lib/common.sh
 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986  LICENSE
 9c287a8c591b63aaaa36c9ecb8bb4113ecef764fc5bbdcd98747771b26852404  payload/assets.tsv
 4fb0603fe9837382bcb6f3022e458fedc64c7aaaf2ec1fb54f025756d4ac6416  payload/firstboot.sh
@@ -17713,7 +17734,7 @@ cat >"$FLEET_UNPACK/SHA256SUMS" <<'FILE_e6351d3766186d2b'
 7715b63f837ba843c0bbec6d3687297a15c2b9aecc9c0dfe31a4fafd4f08b23b  payload/fleet-firstboot.timer
 24f430c5a64517b15151b181d75df56e4df346f23bfe75ab61a889659a7e8c21  payload/installer-swap.sh
 4a10b672dbc6433af77e0106a05e9ca62adfccbe29a3e4b4fd017468681292b0  payload/late.sh
-a34792b262482a5388d7586cee30d33bd1d356f42c3f3c619a3890d0947ba9ee  reinstall.sh
+9bc135aa12f201364a8c569882bc44db2ccdf0caa3c5087047af59c8892a428f  reinstall.sh
 6d7c281c455bccd7b06e8e097ac26e52ebf4daeb4ddd964ab55bea1b66f3a2c5  upstream-changes.patch
 721e4ffeb3ca90d8db48229a720d1948c096fdd1917d1731f30e07058e25586c  vendor/debian.cfg
 fbad1d795495505aab7498bdcd37824d92040aa8783023844b5f5f848d8cb496  vendor/fix-eth-name.initd
