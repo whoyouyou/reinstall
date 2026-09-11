@@ -1627,19 +1627,65 @@ for key in DEBIAN_VER TARGET_USER SSH_PORT TIMEZONE ENABLE_BBR ENABLE_FAIL2BAN E
     printf '%s=%q\n' "$key" "${!key}" >>"$STAGE/config.sh"
 done
 : >"$STAGE/dns.conf"
+
+HAS_IPV4_ROUTE=no
+HAS_IPV6_ROUTE=no
+
+ip -4 route show default | grep -q . && HAS_IPV4_ROUTE=yes
+ip -6 route show default | grep -q . && HAS_IPV6_ROUTE=yes
+
+dns_family_available() {
+    local dns=$1
+
+    if [[ $dns == *:* ]]; then
+        [[ $HAS_IPV6_ROUTE == yes ]]
+    else
+        [[ $HAS_IPV4_ROUTE == yes ]]
+    fi
+}
+
+add_dns() {
+    local dns=$1
+
+    valid_dns "$dns" || return 1
+    dns_family_available "$dns" || return 1
+
+    grep -Fqx "nameserver $dns" "$STAGE/dns.conf" ||
+        printf 'nameserver %s
+' "$dns" >>"$STAGE/dns.conf"
+}
+
 if ((${#DNS_SERVERS[@]})); then
     for dns in "${DNS_SERVERS[@]}"; do
-        printf 'nameserver %s\n' "$dns" >>"$STAGE/dns.conf"
+        valid_dns "$dns" ||
+            die "无效的 DNS 地址：$dns"
+
+        dns_family_available "$dns" ||
+            die "当前网络没有可用路由连接 DNS：$dns"
+
+        add_dns "$dns"
     done
 else
-    while read -r label dns rest; do
-        [[ $label == nameserver ]] || continue
-        valid_dns "$dns" || continue
-        printf 'nameserver %s\n' "$dns" >>"$STAGE/dns.conf"
-    done </etc/resolv.conf
+    RESOLVER_FILES=(
+        /run/systemd/resolve/resolv.conf
+        /run/NetworkManager/no-stub-resolv.conf
+        /etc/resolv.conf
+    )
+
+    for resolver_file in "${RESOLVER_FILES[@]}"; do
+        [[ -r $resolver_file ]] || continue
+
+        while read -r label dns rest; do
+            [[ $label == nameserver ]] || continue
+            add_dns "$dns" || true
+        done <"$resolver_file"
+    done
 fi
+
 if [[ ! -s $STAGE/dns.conf ]]; then
-    printf '未从 resolv.conf 取得直接上游 DNS；将使用上游安装器的动态 DNS/后备逻辑。\n'
+    printf '%s
+' \
+        '未取得可直接使用的上游 DNS；不覆盖安装器自动生成的 DNS。'
 fi
 CODENAME=trixie; [[ $DEBIAN_VER == 12 ]] && CODENAME=bookworm
 download "https://deb.debian.org/debian/dists/$CODENAME/InRelease" "$STAGE/InRelease"
@@ -17667,7 +17713,7 @@ cat >"$FLEET_UNPACK/SHA256SUMS" <<'FILE_e6351d3766186d2b'
 7715b63f837ba843c0bbec6d3687297a15c2b9aecc9c0dfe31a4fafd4f08b23b  payload/fleet-firstboot.timer
 24f430c5a64517b15151b181d75df56e4df346f23bfe75ab61a889659a7e8c21  payload/installer-swap.sh
 4a10b672dbc6433af77e0106a05e9ca62adfccbe29a3e4b4fd017468681292b0  payload/late.sh
-9164dcc56a2012fbaa47cf88a33bd3fdbaf4a9f2e047a5d0d4af52adbf85663c  reinstall.sh
+a34792b262482a5388d7586cee30d33bd1d356f42c3f3c619a3890d0947ba9ee  reinstall.sh
 6d7c281c455bccd7b06e8e097ac26e52ebf4daeb4ddd964ab55bea1b66f3a2c5  upstream-changes.patch
 721e4ffeb3ca90d8db48229a720d1948c096fdd1917d1731f30e07058e25586c  vendor/debian.cfg
 fbad1d795495505aab7498bdcd37824d92040aa8783023844b5f5f848d8cb496  vendor/fix-eth-name.initd
